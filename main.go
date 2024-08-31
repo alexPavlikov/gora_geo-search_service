@@ -5,10 +5,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math/rand"
+	"sync"
 	"time"
 
 	"github.com/IBM/sarama"
 	"github.com/jackc/pgx/v4/pgxpool"
+)
+
+const (
+	LEN_BATCH          = 15
+	TICKER_SECOND_TIME = 5
 )
 
 func main() {
@@ -36,59 +43,53 @@ func main() {
 
 	slog.Info("start", "config", cfg)
 
+	//-------------------------------пример-------------------------------
 	producer, err := GetProducer(cfg.ToString())
 	if err != nil {
 		slog.Error("failed get producer", "error", err)
 		return
 	}
 
-	var crd = Cord{
-		DriverID:  1,
-		Latitude:  2,
-		Longitude: 3,
-	}
+	var wg sync.WaitGroup
 
-	if err := SendMessage(context.TODO(), crd, cfg, producer); err != nil {
-		slog.Error("failed send message to kafka", "error", err)
-		return
-	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			var crd = Cord{
+				DriverID:  rand.Intn(100000),
+				Latitude:  float32(rand.Intn(100000)),
+				Longitude: float32(rand.Intn(100000)),
+			}
 
-	consumer, stop, err := GetConsumer(cfg.ToString())
+			if err := SendMessage(context.TODO(), crd, cfg, producer); err != nil {
+				slog.Error("failed send message to kafka", "error", err)
+				return
+			}
+		}
+	}()
+	defer wg.Wait()
+
+	//--------------------------------------------------------------
+
+	consumer, err := GetConsumer(cfg.ToString())
 	if err != nil {
 		slog.Error("failed get consumer", "error", err)
 		return
 	}
-
-	defer stop()
-
-	msg, err := ReadMessageFromKafka(consumer, cfg.Topic)
-	if err != nil {
-		slog.Error("failed read message from kafka", "error", err)
-		return
-	}
-
-	slog.Info("Message", "msg", msg)
-
-	cord := Cord{
-		DriverID:  1,
-		Latitude:  2,
-		Longitude: 3,
-	}
-
-	slog.Info("cords from kafka", "data", cord)
 
 	conn, err := Connect(context.TODO(), &cfg)
 	if err != nil {
 		slog.Info("failed connect to database", "error", err)
 	}
 
-	repo := New(context.TODO(), conn)
+	repo := New(conn)
 
-	if err := repo.InsertCordToGIS(context.TODO(), cord); err != nil {
-		slog.Info("failed insert cord to postgres", "error", err)
+	err = repo.ReadMessageFromKafka(consumer, cfg.Topic)
+	if err != nil {
+		slog.Error("failed read message from kafka", "error", err)
 		return
 	}
-
 }
 
 type Config struct {
@@ -119,39 +120,73 @@ type Cord struct {
 }
 
 // kafka
-func GetConsumer(address ...string) (sarama.Consumer, func() error, error) {
+func GetConsumer(address ...string) (sarama.Consumer, error) {
 	consumer, err := sarama.NewConsumer(address, nil)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed get new consumer: %w", err)
+		return nil, fmt.Errorf("failed get new consumer: %w", err)
 	}
 
-	return consumer, consumer.Close, nil
+	return consumer, nil
 }
 
-func ReadMessageFromKafka(consumer sarama.Consumer, topic string) (cord Cord, err error) {
+func (r *Repository) ReadMessageFromKafka(consumer sarama.Consumer, topic string) error {
 	partition, err := consumer.Partitions(topic)
 	if err != nil {
-		return Cord{}, fmt.Errorf("failed to get partition: %w", err)
+		return fmt.Errorf("failed to get partition: %w", err)
 	}
 
-	partitionConsumer, err := consumer.ConsumePartition(topic, partition[0], sarama.OffsetNewest)
+	partitionConsumer, err := consumer.ConsumePartition(topic, partition[0], sarama.OffsetOldest)
 	if err != nil {
-		return Cord{}, fmt.Errorf("failed to get ConsumePartition: %w", err)
+		return fmt.Errorf("failed to get ConsumePartition: %w", err)
 	}
 
 	defer partitionConsumer.Close()
 
-	msg := <-partitionConsumer.Messages()
+	ticker := time.NewTicker(TICKER_SECOND_TIME * time.Second)
 
-	if err := json.Unmarshal(msg.Value, &cord); err != nil {
-		return Cord{}, fmt.Errorf("failed unmarshal result from kafka: %w", err)
-	}
+	var wg sync.WaitGroup
 
-	return cord, nil
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+
+		var cords = make(map[int]Cord)
+		var cord Cord
+
+		for {
+			select {
+			case msg := <-partitionConsumer.Messages():
+				if err := json.Unmarshal(msg.Value, &cord); err != nil {
+					slog.Error("failed unmarshal result from kafka", "error", err)
+					return
+				}
+
+				cords[cord.DriverID] = cord
+
+				if len(cords) == LEN_BATCH {
+					if err := r.InsertBatchCordToGIS(context.TODO(), cords); err != nil {
+						slog.Error("failed insert cords to postgres", "error", err)
+						return
+					}
+				}
+
+			case <-ticker.C:
+				if err := r.InsertBatchCordToGIS(context.TODO(), cords); err != nil {
+					slog.Error("failed insert cords to postgres", "error", err)
+					return
+				}
+			}
+		}
+	}()
+
+	wg.Wait()
+	return nil
 }
 
+//-------------------------------пример-------------------------------
+
 func GetProducer(address ...string) (producer sarama.SyncProducer, err error) {
-	producer, err = sarama.NewSyncProducer(address, nil) //....
+	producer, err = sarama.NewSyncProducer(address, nil)
 	if err != nil {
 		return nil, fmt.Errorf("error creating producer: %w", err)
 	}
@@ -173,8 +208,6 @@ func SendMessage(ctx context.Context, cord Cord, cfg Config, producer sarama.Syn
 		Timestamp: time.Now(),
 	}
 
-	slog.Info("send message to kafka", "message key", cord.DriverID)
-
 	if _, _, err := producer.SendMessage(&msg); err != nil {
 		return err
 	}
@@ -182,17 +215,17 @@ func SendMessage(ctx context.Context, cord Cord, cfg Config, producer sarama.Syn
 	return nil
 }
 
+//--------------------------------------------------------------
+
 // postgres
 
 type Repository struct {
-	ctx context.Context
-	DB  *pgxpool.Pool
+	DB *pgxpool.Pool
 }
 
-func New(ctx context.Context, DB *pgxpool.Pool) *Repository {
+func New(DB *pgxpool.Pool) *Repository {
 	return &Repository{
-		ctx: ctx,
-		DB:  DB,
+		DB: DB,
 	}
 }
 
@@ -205,18 +238,22 @@ func Connect(ctx context.Context, cfg *Config) (conn *pgxpool.Pool, err error) {
 	return conn, nil
 }
 
-func (r *Repository) InsertCordToGIS(ctx context.Context, cord Cord) error {
-	query := `
-	INSERT INTO public."cords" (driver_id, latitude, longitude) VALUES ($1, $2, $3) RETURNING id
-	`
+func (r *Repository) InsertBatchCordToGIS(ctx context.Context, cords map[int]Cord) error {
+	for _, cord := range cords {
+		query := `
+		INSERT INTO public."cords" (driver_id, latitude, longitude) VALUES ($1, $2, $3) 
+		ON CONFLICT (driver_id) DO UPDATE SET driver_id = $4, latitude = $5, longitude = $6 
+		RETURNING id
+		`
 
-	row := r.DB.QueryRow(ctx, query, cord.DriverID, cord.Latitude, cord.Longitude)
+		row := r.DB.QueryRow(ctx, query, cord.DriverID, cord.Latitude, cord.Longitude, cord.DriverID, cord.Latitude, cord.Longitude)
 
-	var id int
+		var id int
 
-	if err := row.Scan(&id); err != nil {
-		return fmt.Errorf("insert cord error: %w", err)
+		if err := row.Scan(&id); err != nil {
+			return fmt.Errorf("insert cord error: %w", err)
+		}
+
 	}
-
 	return nil
 }
