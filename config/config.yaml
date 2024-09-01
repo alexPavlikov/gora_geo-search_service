@@ -1,0 +1,16 @@
+env: "local"
+timeout: 3
+log_level: 0
+server:
+  path: "localhost"
+  port: 8080
+kafka:
+  path: "localhost"
+  port: 9092
+topic: "driver"
+pg_address:
+  path: "localhost"
+  port: 5432
+pg_user: "postgres"
+pg_password: "AlexPAV2307"
+pg_dbname: "cord"
