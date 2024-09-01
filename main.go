@@ -37,7 +37,7 @@ func main() {
 			Port: 5432,
 		},
 		PostgresUser:         "postgres",
-		PostgresPassword:     "AlexPAV2307",
+		PostgresPassword:     "",
 		PostgresDatabaseName: "cord",
 	}
 
