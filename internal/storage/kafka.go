@@ -4,8 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log/slog"
-	"sync"
 	"time"
 
 	"github.com/IBM/sarama"
@@ -43,43 +41,32 @@ func (r *Repository) ReadMessageFromKafka(consumer sarama.Consumer, topic string
 
 	ticker := time.NewTicker(TICKER_SECOND_TIME * time.Second)
 
-	var wg sync.WaitGroup
+	var cords = make(map[int]models.Cord)
+	var cord models.Cord
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-
-		var cords = make(map[int]models.Cord)
-		var cord models.Cord
-
-		for {
-			select {
-			case msg := <-partitionConsumer.Messages():
-				if err := json.Unmarshal(msg.Value, &cord); err != nil {
-					slog.Error("failed unmarshal result from kafka", "error", err)
-					return
-				}
-
-				cords[cord.DriverID] = cord
-
-				if len(cords) == LEN_BATCH {
-					if err := r.InsertBatchCordToGIS(context.TODO(), cords); err != nil {
-						slog.Error("failed insert cords to postgres", "error", err)
-						return
-					}
-				}
-
-			case <-ticker.C:
-				if err := r.InsertBatchCordToGIS(context.TODO(), cords); err != nil {
-					slog.Error("failed insert cords to postgres", "error", err)
-					return
-				}
+	for {
+		select {
+		case msg := <-partitionConsumer.Messages():
+			if err := json.Unmarshal(msg.Value, &cord); err != nil {
+				return fmt.Errorf("failed unmarshal result from kafka: %w", err)
 			}
-		}
-	}()
 
-	wg.Wait()
-	return nil
+			cords[cord.DriverID] = cord
+
+			if len(cords) == LEN_BATCH {
+				if err := r.InsertBatchCordToGIS(context.TODO(), cords); err != nil {
+					return fmt.Errorf("failed insert cords to postgres: %w", err)
+				}
+				cords = make(map[int]models.Cord)
+			}
+
+		case <-ticker.C:
+			if err := r.InsertBatchCordToGIS(context.TODO(), cords); err != nil {
+				return fmt.Errorf("failed insert cords to postgres: %w", err)
+			}
+			cords = make(map[int]models.Cord)
+		}
+	}
 }
 
 //-------------------------------пример-------------------------------

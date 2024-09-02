@@ -2,11 +2,16 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log"
 
 	"github.com/alexPavlikov/gora_geo-search_service/internal/config"
 	"github.com/alexPavlikov/gora_geo-search_service/internal/models"
-	"github.com/jackc/pgx/v4/pgxpool"
+	"github.com/jackc/pgconn"
+	"github.com/jackc/pgerrcode"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type Repository struct {
@@ -21,7 +26,7 @@ func New(DB *pgxpool.Pool) *Repository {
 
 func Connect(ctx context.Context, cfg *config.Config) (conn *pgxpool.Pool, err error) {
 	databaseURL := fmt.Sprintf("postgres://%s:%s@%s:%d/%s", cfg.PostgresUser, cfg.PostgresPassword, cfg.PostgresAddress.Path, cfg.PostgresAddress.Port, cfg.PostgresDatabaseName)
-	conn, err = pgxpool.Connect(ctx, databaseURL)
+	conn, err = pgxpool.New(ctx, databaseURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed connect to database: %w", err)
 	}
@@ -29,21 +34,39 @@ func Connect(ctx context.Context, cfg *config.Config) (conn *pgxpool.Pool, err e
 }
 
 func (r *Repository) InsertBatchCordToGIS(ctx context.Context, cords map[int]models.Cord) error {
-	for _, cord := range cords {
-		query := `
-		INSERT INTO public."cords" (driver_id, latitude, longitude) VALUES ($1, $2, $3) 
-		ON CONFLICT (driver_id) DO UPDATE SET driver_id = $4, latitude = $5, longitude = $6 
+
+	query := `
+		INSERT INTO public."cords" (driver_id, latitude, longitude) VALUES (@driver_id, @latitude, @longitude)
+		ON CONFLICT (driver_id) DO UPDATE SET driver_id = @driver_id, latitude = @latitude, longitude =  @longitude
 		RETURNING id
-		`
+	`
 
-		row := r.DB.QueryRow(ctx, query, cord.DriverID, cord.Latitude, cord.Longitude, cord.DriverID, cord.Latitude, cord.Longitude)
+	batch := &pgx.Batch{}
 
-		var id int
-
-		if err := row.Scan(&id); err != nil {
-			return fmt.Errorf("insert cord error: %w", err)
+	for _, v := range cords {
+		args := pgx.NamedArgs{
+			"driver_id": v.DriverID,
+			"latitude":  v.Latitude,
+			"longitude": v.Longitude,
 		}
-
+		batch.Queue(query, args)
 	}
-	return nil
+
+	result := r.DB.SendBatch(ctx, batch)
+	defer result.Close()
+
+	for _, cord := range cords {
+		_, err := result.Exec()
+		if err != nil {
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == pgerrcode.UniqueViolation {
+				log.Printf("driver %d already exists", cord.DriverID)
+				continue
+			}
+
+			return fmt.Errorf("unable to insert row: %w", err)
+		}
+	}
+
+	return result.Close()
 }
